@@ -58,6 +58,7 @@ struct reliable_state {
     conn_t*     c;      // The connection
 
     struct ringbuf* pkt_buf;
+    packet_t    pkt_recieved; // Last packet recieved.
 };
 rel_t *rel_list;
 
@@ -113,7 +114,17 @@ void rel_destroy (rel_t *r) {
 
 // Called whenever we have recieved a packet.
 void rel_recvpkt (rel_t *r, packet_t *pkt, size_t n) {
-    printf("Recieved something!\n");
+    // Transform back to host ordering.
+    pkt->len = ntohs(pkt->len);
+
+    printf("[RECV] Packet of length %i with cksum %i\n", pkt->len, pkt->cksum);
+
+    int bytes_outputted = conn_output(r->c, pkt->data, (pkt->len - 12));
+    if (bytes_outputted <= 0) {
+        printf("There was an error.\n");
+    }
+
+    r->pkt_recieved = *pkt;
 }
 
 // Called once we are supposed to send some data over a connection.
@@ -125,18 +136,16 @@ void rel_read (rel_t *s) {
 
     // Read as much packets as possible into the current window.
     while ((bytes_read = conn_input(s->c, inp_buf, 500)) > 0) {
-        printf("\t-> %i bytes", bytes_read);
-
         // Construct a packet.
         packet_t* pkt = (packet_t*) xmalloc(sizeof(packet_t));
         pkt->cksum = cksum(inp_buf, bytes_read); // compute 16-bit checksum
-        pkt->len = bytes_read;
-        memcpy(inp_buf, pkt->data, bytes_read);
+        pkt->len = htons(bytes_read + 12);
+        memcpy(pkt->data, inp_buf, bytes_read);
 
         if (put_pkt(s->pkt_buf, pkt)) {
             // The packet is placed under LAST_FRAME_SENT.
             // So lets send it..
-            printf("[SEND]\n");
+            printf("\t-> [SEND] %i bytes with checksum %i\n", bytes_read, pkt->cksum);
             conn_sendpkt(s->c, pkt, pkt->len);
         } else {
             // The window is full.
@@ -145,8 +154,12 @@ void rel_read (rel_t *s) {
     }
 }
 
+// Called whenever output space becomes available.
 void rel_output (rel_t *r) {
+    size_t bytes_available = conn_bufspace(r->c);
+    printf("Outputting %lu bytes.", bytes_available);
 
+    conn_output(r->c, r->pkt_recieved.data, bytes_available);
 }
 
 void rel_timer () {
