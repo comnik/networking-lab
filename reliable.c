@@ -111,8 +111,9 @@ void rel_destroy (rel_t *r) {
     free(r->pkt_buf);
 }
 
+// Called whenever we have recieved a packet.
 void rel_recvpkt (rel_t *r, packet_t *pkt, size_t n) {
-
+    printf("Recieved something!\n");
 }
 
 // Called once we are supposed to send some data over a connection.
@@ -132,7 +133,12 @@ void rel_read (rel_t *s) {
         pkt->len = bytes_read;
         memcpy(inp_buf, pkt->data, bytes_read);
 
-        if (!put_pkt(s->pkt_buf, pkt)) {
+        if (put_pkt(s->pkt_buf, pkt)) {
+            // The packet is placed under LAST_FRAME_SENT.
+            // So lets send it..
+            printf("[SEND]\n");
+            conn_sendpkt(s->c, pkt, pkt->len);
+        } else {
             // The window is full.
             break;
         }
