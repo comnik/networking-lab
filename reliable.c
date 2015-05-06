@@ -14,6 +14,7 @@
 
 #include "rlib.h"
 
+#define PAYLOAD_SIZE 5
 
 // A ringbuffer is used to buffer packets
 // that are waiting for further processing.
@@ -21,15 +22,27 @@ struct ringbuf {
     uint32_t    reader;
     uint32_t    writer;
     size_t      size;
+    size_t      count;
     packet_t*   buffer;
 };
 
+// Returns the number of available data for the reader.
+uint32_t buf_data (struct ringbuf* buf) {
+    return ((buf->writer + 1) % buf->size) - buf->reader - 1;
+}
+
+// Returns the number of available slots for the writer.
+uint32_t buf_space (struct ringbuf* buf) {
+    return buf->size - buf->count;
+}
+
 // Places a packet on the ringbuffer if space is left.
 // Returns 0 if the operation succeeded, 1 otherwise.
-int put_pkt(struct ringbuf* buf, packet_t* pkt) {
-    if (labs(buf->writer - buf->reader) <= buf->size) {
+int put_pkt (struct ringbuf* buf, packet_t* pkt) {
+    if (buf->count < buf->size) {
         buf->buffer[buf->writer] = *pkt;
         buf->writer = (buf->writer + 1) % (buf->size);
+        buf->count += 1;
 
         return 0;
     } else {
@@ -39,13 +52,15 @@ int put_pkt(struct ringbuf* buf, packet_t* pkt) {
 
 // Pops the next packet from the ringbuffer, if one is available.
 // Returns 0 if the operation suceeded, 1 otherwise.
-int pop_pkt(struct ringbuf* buf, packet_t* pkt_out) {
-    if (buf->writer < buf->reader) {
-        *pkt_out = buf->buffer[buf->reader];
+int pop_pkt (struct ringbuf* buf) {
+    if (buf->count > 0) {
+        // *pkt_out = buf->buffer[buf->reader];
         buf->reader = (buf->reader + 1) % (buf->size);
+        buf->count -= 1;
 
         return 0;
     } else {
+        fprintf(stderr, "No packages left to pop");
         // No packages left.
         return 1;
     }
@@ -59,6 +74,8 @@ struct reliable_state {
 
     struct ringbuf* pkt_buf;
     packet_t    pkt_recieved; // Last packet recieved.
+
+    uint32_t    next_seqno; // The first sequence number in this stream.
 };
 rel_t *rel_list;
 
@@ -79,6 +96,7 @@ rel_t* rel_create (conn_t *c, const struct sockaddr_storage *ss, const struct co
     }
 
     r->c = c;
+    r->next_seqno = 1;
     r->next = rel_list;
     r->prev = &rel_list;
     if (rel_list)
@@ -87,6 +105,8 @@ rel_t* rel_create (conn_t *c, const struct sockaddr_storage *ss, const struct co
 
     // Initialize the buffers
     r->pkt_buf = (struct ringbuf*) xmalloc(sizeof(struct ringbuf));
+    r->pkt_buf->writer = 0;
+    r->pkt_buf->reader = 0;
     r->pkt_buf->size = cc->window;
     r->pkt_buf->buffer = (packet_t*) calloc(cc->window, sizeof(packet_t));
 
@@ -115,41 +135,68 @@ void rel_destroy (rel_t *r) {
 // Called whenever we have recieved a packet.
 void rel_recvpkt (rel_t *r, packet_t *pkt, size_t n) {
     // Transform back to host ordering.
-    pkt->len = ntohs(pkt->len);
+    pkt->seqno  = ntohs(pkt->seqno);
+    pkt->ackno  = ntohs(pkt->ackno);
+    pkt->len    = ntohs(pkt->len);
 
-    printf("[RECV] Packet of length %i with cksum %i\n", pkt->len, pkt->cksum);
+    // Check if we're dealing with an ACK.
+    if (pkt->len == 8) {
+        fprintf(stderr, "[ACK] %u\n", pkt->ackno);
 
-    int bytes_outputted = conn_output(r->c, pkt->data, (pkt->len - 12));
-    if (bytes_outputted <= 0) {
-        printf("There was an error.\n");
+        // Advance the LAR
+        pop_pkt(r->pkt_buf);
+        rel_read(r);
+
+    } else {
+        // Send ACK.
+        struct ack_packet* ack = (struct ack_packet*) xmalloc(sizeof(struct ack_packet));
+        ack->cksum  = 0;
+        ack->ackno  = ntohs(pkt->seqno);
+        ack->len    = ntohs(8);
+        ack->cksum  = cksum(ack, 8);
+
+        conn_sendpkt(r->c, (packet_t*) ack, 8);
+
+        // Output payload.
+        int bytes_outputted = conn_output(r->c, pkt->data, (pkt->len - 12));
+        if (bytes_outputted <= 0) {
+            fprintf(stderr, "There was an error.\n");
+        }
+
+        r->pkt_recieved = *pkt;
     }
 
-    r->pkt_recieved = *pkt;
 }
 
 // Called once we are supposed to send some data over a connection.
 void rel_read (rel_t *s) {
-    int bytes_read;
-    void* inp_buf = xmalloc(500);
+    void* inp_buf = xmalloc(PAYLOAD_SIZE);
 
-    printf("Reading from input...\n");
+    if (buf_space(s->pkt_buf) > 0) {
+        // Read a single packet into the current window.
+        int bytes_read = conn_input(s->c, inp_buf, PAYLOAD_SIZE);
 
-    // Read as much packets as possible into the current window.
-    while ((bytes_read = conn_input(s->c, inp_buf, 500)) > 0) {
-        // Construct a packet.
-        packet_t* pkt = (packet_t*) xmalloc(sizeof(packet_t));
-        pkt->cksum = cksum(inp_buf, bytes_read); // compute 16-bit checksum
-        pkt->len = htons(bytes_read + 12);
-        memcpy(pkt->data, inp_buf, bytes_read);
+        if (bytes_read > 0) {
+            // Construct a packet.
+            packet_t* pkt = (packet_t*) xmalloc(sizeof(packet_t));
+            pkt->cksum  = 0;
+            pkt->seqno  = htons(s->next_seqno);
+            pkt->len    = htons(bytes_read + 12);
 
-        if (put_pkt(s->pkt_buf, pkt)) {
-            // The packet is placed under LAST_FRAME_SENT.
-            // So lets send it..
-            printf("\t-> [SEND] %i bytes with checksum %i\n", bytes_read, pkt->cksum);
-            conn_sendpkt(s->c, pkt, pkt->len);
-        } else {
-            // The window is full.
-            break;
+            // Set the payload.
+            memcpy(pkt->data, inp_buf, bytes_read);
+
+            // Compute checksum.
+            pkt->cksum = cksum(pkt, bytes_read + 12);
+
+            // Update seqno counter.
+            s->next_seqno += 1;
+
+            if (put_pkt(s->pkt_buf, pkt) == 0) {
+                // The packet is placed under LAST_FRAME_SENT, so we need to actually send it.
+                fprintf(stderr, "[SEND] %u\n", ntohs(pkt->seqno));
+                conn_sendpkt(s->c, pkt, pkt->len);
+            }
         }
     }
 }
@@ -157,7 +204,7 @@ void rel_read (rel_t *s) {
 // Called whenever output space becomes available.
 void rel_output (rel_t *r) {
     size_t bytes_available = conn_bufspace(r->c);
-    printf("Outputting %lu bytes.", bytes_available);
+    fprintf(stderr, "Outputting %lu bytes.", bytes_available);
 
     conn_output(r->c, r->pkt_recieved.data, bytes_available);
 }
