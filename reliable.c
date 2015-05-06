@@ -14,7 +14,7 @@
 
 #include "rlib.h"
 
-#define PAYLOAD_SIZE 5
+#define PAYLOAD_SIZE 500
 
 // A ringbuffer is used to buffer packets
 // that are waiting for further processing.
@@ -25,11 +25,6 @@ struct ringbuf {
     size_t      count;
     packet_t*   buffer;
 };
-
-// Returns the number of available data for the reader.
-uint32_t buf_data (struct ringbuf* buf) {
-    return ((buf->writer + 1) % buf->size) - buf->reader - 1;
-}
 
 // Returns the number of available slots for the writer.
 uint32_t buf_space (struct ringbuf* buf) {
@@ -50,18 +45,25 @@ int put_pkt (struct ringbuf* buf, packet_t* pkt) {
     }
 }
 
-// Pops the next packet from the ringbuffer, if one is available.
-// Returns 0 if the operation suceeded, 1 otherwise.
-int pop_pkt (struct ringbuf* buf) {
+// Reads the next packet from the ringbuffer, if one is available.
+packet_t* read_pkt (struct ringbuf* buf) {
     if (buf->count > 0) {
-        // *pkt_out = buf->buffer[buf->reader];
+        return &(buf->buffer[buf->reader]);
+    } else {
+        return NULL;
+    }
+}
+
+// Advances the reader position.
+int pop_pkt (struct ringbuf* buf) {
+    packet_t* next_pkt = read_pkt(buf);
+
+    if (next_pkt != NULL) {
         buf->reader = (buf->reader + 1) % (buf->size);
         buf->count -= 1;
 
         return 0;
     } else {
-        fprintf(stderr, "No packages left to pop");
-        // No packages left.
         return 1;
     }
 }
@@ -135,31 +137,46 @@ void rel_destroy (rel_t *r) {
 // Called whenever we have recieved a packet.
 void rel_recvpkt (rel_t *r, packet_t *pkt, size_t n) {
     // Transform back to host ordering.
-    pkt->seqno  = ntohs(pkt->seqno);
-    pkt->ackno  = ntohs(pkt->ackno);
+    pkt->seqno  = ntohl(pkt->seqno);
+    pkt->ackno  = ntohl(pkt->ackno);
     pkt->len    = ntohs(pkt->len);
 
     // Check if we're dealing with an ACK.
     if (pkt->len == 8) {
-        fprintf(stderr, "[ACK] %u\n", pkt->ackno);
+        // Advance LAR up to the highest seqno ACKed.
+        packet_t* next_pkt = read_pkt(r->pkt_buf);
 
-        // Advance the LAR
-        pop_pkt(r->pkt_buf);
+        while (next_pkt != NULL && ntohs(next_pkt->seqno) < pkt->ackno) {
+            fprintf(stderr, "[ACK] %u\n", ntohs(next_pkt->seqno));
+            pop_pkt(r->pkt_buf);
+            next_pkt = read_pkt(r->pkt_buf);
+        }
+
+        // Buffer has space now, read remaining inputs.
         rel_read(r);
 
     } else {
         // Send ACK.
         struct ack_packet* ack = (struct ack_packet*) xmalloc(sizeof(struct ack_packet));
         ack->cksum  = 0;
-        ack->ackno  = ntohs(pkt->seqno);
-        ack->len    = ntohs(8);
+        ack->ackno  = htonl(pkt->seqno + 1); // We are waiting for the next higher seqno.
+        ack->len    = htons(8);
         ack->cksum  = cksum(ack, 8);
 
-        conn_sendpkt(r->c, (packet_t*) ack, 8);
+        if (r->pkt_buf->count == 0) {
+            // No outgoing packets, simply go ahead and send it.
+            put_pkt(r->pkt_buf, (packet_t*) ack);
+            conn_sendpkt(r->c, (packet_t*) ack, 8);
+
+            fprintf(stderr, "Sending ACK for %u\n", ntohl(ack->ackno));
+        } else {
+            // @TODO: Piggybacking!
+            conn_sendpkt(r->c, (packet_t*) ack, 8); // Not good, ACKs need to be buffered as well
+        }
 
         // Output payload.
         int bytes_outputted = conn_output(r->c, pkt->data, (pkt->len - 12));
-        if (bytes_outputted <= 0) {
+        if (bytes_outputted < 0) {
             fprintf(stderr, "There was an error.\n");
         }
 
@@ -176,15 +193,17 @@ void rel_read (rel_t *s) {
         // Read a single packet into the current window.
         int bytes_read = conn_input(s->c, inp_buf, PAYLOAD_SIZE);
 
-        if (bytes_read > 0) {
+        if (bytes_read >= 0) {
             // Construct a packet.
             packet_t* pkt = (packet_t*) xmalloc(sizeof(packet_t));
             pkt->cksum  = 0;
-            pkt->seqno  = htons(s->next_seqno);
+            pkt->seqno  = htonl(s->next_seqno);
             pkt->len    = htons(bytes_read + 12);
 
             // Set the payload.
-            memcpy(pkt->data, inp_buf, bytes_read);
+            if (bytes_read > 0) {
+                memcpy(pkt->data, inp_buf, bytes_read);
+            }
 
             // Compute checksum.
             pkt->cksum = cksum(pkt, bytes_read + 12);
