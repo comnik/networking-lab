@@ -13,14 +13,18 @@
 #include <netinet/in.h>
 
 #include "rlib.h"
+#include "reliable.h"
 
 #define PAYLOAD_SIZE 500
+
+
+// [BUFFER]
 
 // A ringbuffer is used to buffer packets
 // that are waiting for further processing.
 struct ringbuf {
-    uint32_t    reader;
-    uint32_t    writer;
+    uint32_t    reader; // really the LAR pointer in our case
+    uint32_t    writer; // really the LFS pointer in our case
     size_t      size;
     size_t      count;
     packet_t*   buffer;
@@ -68,18 +72,113 @@ int pop_pkt (struct ringbuf* buf) {
     }
 }
 
+
+// [STATE]
+
 struct reliable_state {
-    rel_t*      next;   // Linked list for traversing all connections
+    rel_t*      next; // Linked list for traversing all connections
     rel_t**     prev;
 
-    conn_t*     c;      // The connection
+    conn_t*     c; // The connection
 
     struct ringbuf* pkt_buf;
-    packet_t    pkt_recieved; // Last packet recieved.
 
-    uint32_t    next_seqno; // The first sequence number in this stream.
+    // The highest unacked seqno of the packet buffer <interval>-ago.
+    // Each packet in the current buffer with seqno <= latest_seqno_snapshot has timed out.
+    uint32_t    latest_seqno_snapshot;
+
+    int         timer; // Store timer configuration.
+    int         timeout; // Store timeout configuration.
+    int         next_timeout; // Milliseconds until the next timeout period.
+
+    uint32_t    next_ackno; // Next packet expected in this stream.
+    uint32_t    next_seqno; // The next sequence number in this stream.
 };
 rel_t *rel_list;
+
+
+// [HELPER FUNCTIONS]
+
+// Returns a packets seqno in host-order.
+// @TODO: Could be implemented as a macro to save the function call.
+uint32_t get_seqno(packet_t* pkt) {
+    return ntohl(pkt->seqno);
+}
+
+// Returns a packets length in host-order.
+// @TODO: Could be implemented as a macro to save the function call.
+uint32_t get_size(packet_t* pkt) {
+    return ntohs(pkt->len);
+}
+
+// Tries to enqueue a new packet with the given payload in the current window.
+// Will automatically transform the packet data to network ordering.
+// If this succeeds, it will immediately send the packet.
+// Returns 0 if it succeeded, 1 otherwise.
+int ingest_pkt (rel_t* r, void* payload, size_t len) {
+    // Check for buffer space early, so we don't waste work.
+    if (buf_space(r->pkt_buf) > 0) {
+        size_t pkt_size = len + 12;
+
+        packet_t* pkt = (packet_t*) xmalloc(sizeof(packet_t));
+
+        pkt->cksum  = 0;
+        pkt->seqno  = htonl(r->next_seqno++);
+        pkt->ackno  = htonl(r->next_ackno);
+        pkt->len    = htons(pkt_size); // payload size + header size
+
+        // Set payload.
+        if (len > 0) {
+            memcpy(pkt->data, payload, len);
+        }
+
+        // Compute checksum.
+        pkt->cksum  = cksum(pkt, pkt_size); // don't use pkt->len here, it's in network order
+
+        // Enqueue, guaranteed to succeed because we checked for buf_space above.
+        put_pkt(r->pkt_buf, pkt);
+
+        // The packet is placed under LAST_FRAME_SENT, so we need to actually send it.
+        fprintf(stderr, "[SEND] %u\n", get_seqno(pkt));
+        conn_sendpkt(r->c, pkt, pkt_size);
+
+        return 0;
+    } else {
+        return 1;
+    }
+}
+
+// Identifies timed-out packets for a connection
+// and updates the latest_seqno_snapshot.
+void resend (rel_t* r) {
+    r->next_timeout -= r->timer; // Count down.
+
+    // Check if timeouts are possible.
+    if (r->next_timeout <= 0 && r->pkt_buf->count > 0) {
+        packet_t* next_pkt;
+        int i;
+
+        // Iterate through all packets in the buffer.
+        for (i = 0; i < r->pkt_buf->count; i++) {
+            next_pkt = &(r->pkt_buf->buffer[r->pkt_buf->reader + i]);
+
+            if (get_seqno(next_pkt) <= r->latest_seqno_snapshot) {
+                fprintf(stderr, "[RE-SEND] %u\n", get_seqno(next_pkt));
+                conn_sendpkt(r->c, next_pkt, get_size(next_pkt));
+            }
+        }
+
+        // We need the seqno of the packet that was added last.
+        // Because we already iterated through the buffer from oldest -> youngest,
+        // this is already stored in next_pkt.
+        r->latest_seqno_snapshot = get_seqno(next_pkt);
+
+        r->next_timeout = r->timeout; // Reset the countdown.
+    }
+}
+
+
+// [LOGIC]
 
 // Creates a new reliable protocol session,
 // returns NULL on failure. ss is always NULL. */
@@ -98,12 +197,21 @@ rel_t* rel_create (conn_t *c, const struct sockaddr_storage *ss, const struct co
     }
 
     r->c = c;
-    r->next_seqno = 1;
     r->next = rel_list;
     r->prev = &rel_list;
     if (rel_list)
     rel_list->prev = &r->next;
     rel_list = r;
+
+    // Initialize sender / reciever state.
+    r->next_seqno = 1;
+    r->next_ackno = 1;
+
+    // Initialize timeout detection.
+    r->latest_seqno_snapshot = 0;
+    r->timer = cc->timer;
+    r->timeout = cc->timeout;
+    r->next_timeout = cc->timeout;
 
     // Initialize the buffers
     r->pkt_buf = (struct ringbuf*) xmalloc(sizeof(struct ringbuf));
@@ -137,17 +245,15 @@ void rel_destroy (rel_t *r) {
 // Called whenever we have recieved a packet.
 void rel_recvpkt (rel_t *r, packet_t *pkt, size_t n) {
     // Transform back to host ordering.
-    pkt->seqno  = ntohl(pkt->seqno);
     pkt->ackno  = ntohl(pkt->ackno);
-    pkt->len    = ntohs(pkt->len);
 
     // Check if we're dealing with an ACK.
-    if (pkt->len == 8) {
+    if (get_size(pkt) == 8) {
         // Advance LAR up to the highest seqno ACKed.
         packet_t* next_pkt = read_pkt(r->pkt_buf);
 
-        while (next_pkt != NULL && ntohs(next_pkt->seqno) < pkt->ackno) {
-            fprintf(stderr, "[ACK] %u\n", ntohs(next_pkt->seqno));
+        while (next_pkt != NULL && get_seqno(next_pkt) < pkt->ackno) {
+            fprintf(stderr, "[ACK] %u\n", get_seqno(next_pkt));
             pop_pkt(r->pkt_buf);
             next_pkt = read_pkt(r->pkt_buf);
         }
@@ -159,7 +265,7 @@ void rel_recvpkt (rel_t *r, packet_t *pkt, size_t n) {
         // Send ACK.
         struct ack_packet* ack = (struct ack_packet*) xmalloc(sizeof(struct ack_packet));
         ack->cksum  = 0;
-        ack->ackno  = htonl(pkt->seqno + 1); // We are waiting for the next higher seqno.
+        ack->ackno  = htonl(++r->next_ackno);
         ack->len    = htons(8);
         ack->cksum  = cksum(ack, 8);
 
@@ -175,12 +281,10 @@ void rel_recvpkt (rel_t *r, packet_t *pkt, size_t n) {
         }
 
         // Output payload.
-        int bytes_outputted = conn_output(r->c, pkt->data, (pkt->len - 12));
+        int bytes_outputted = conn_output(r->c, pkt->data, (get_size(pkt) - 12));
         if (bytes_outputted < 0) {
             fprintf(stderr, "There was an error.\n");
         }
-
-        r->pkt_recieved = *pkt;
     }
 
 }
@@ -194,28 +298,7 @@ void rel_read (rel_t *s) {
         int bytes_read = conn_input(s->c, inp_buf, PAYLOAD_SIZE);
 
         if (bytes_read >= 0) {
-            // Construct a packet.
-            packet_t* pkt = (packet_t*) xmalloc(sizeof(packet_t));
-            pkt->cksum  = 0;
-            pkt->seqno  = htonl(s->next_seqno);
-            pkt->len    = htons(bytes_read + 12);
-
-            // Set the payload.
-            if (bytes_read > 0) {
-                memcpy(pkt->data, inp_buf, bytes_read);
-            }
-
-            // Compute checksum.
-            pkt->cksum = cksum(pkt, bytes_read + 12);
-
-            // Update seqno counter.
-            s->next_seqno += 1;
-
-            if (put_pkt(s->pkt_buf, pkt) == 0) {
-                // The packet is placed under LAST_FRAME_SENT, so we need to actually send it.
-                fprintf(stderr, "[SEND] %u\n", ntohs(pkt->seqno));
-                conn_sendpkt(s->c, pkt, pkt->len);
-            }
+            ingest_pkt(s, inp_buf, bytes_read);
         }
     }
 }
@@ -223,11 +306,20 @@ void rel_read (rel_t *s) {
 // Called whenever output space becomes available.
 void rel_output (rel_t *r) {
     size_t bytes_available = conn_bufspace(r->c);
-    fprintf(stderr, "Outputting %lu bytes.", bytes_available);
+    fprintf(stderr, "\t -> Can now output %lu more bytes.", bytes_available);
 
-    conn_output(r->c, r->pkt_recieved.data, bytes_available);
+    // @TODO
 }
 
+// Calls resend on every active connection.
 void rel_timer () {
-    /* Retransmit any packets that need to be retransmitted */
+    // fprintf(stderr, "\t -> [TIMER] \n");
+
+    if (rel_list) {
+        rel_t* r = rel_list;
+        while (r != NULL) {
+            resend(r);
+            r = r->next;
+        }
+    }
 }
