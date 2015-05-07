@@ -13,7 +13,6 @@
 #include <netinet/in.h>
 
 #include "rlib.h"
-#include "reliable.h"
 
 #define PAYLOAD_SIZE 500
 
@@ -93,6 +92,9 @@ struct reliable_state {
 
     uint32_t    next_ackno; // Next packet expected in this stream.
     uint32_t    next_seqno; // The next sequence number in this stream.
+
+    // State flags
+    int         read_error;
 };
 rel_t *rel_list;
 
@@ -115,10 +117,13 @@ uint32_t get_size(packet_t* pkt) {
 // Will automatically transform the packet data to network ordering.
 // If this succeeds, it will immediately send the packet.
 // Returns 0 if it succeeded, 1 otherwise.
-int ingest_pkt (rel_t* r, void* payload, size_t len) {
+int ingest_pkt (rel_t* r, void* payload, int len) {
     // Check for buffer space early, so we don't waste work.
     if (buf_space(r->pkt_buf) > 0) {
-        size_t pkt_size = len + 12;
+        uint16_t pkt_size = 12;
+        if (len > 0) {
+            pkt_size = len + 12;
+        }
 
         packet_t* pkt = (packet_t*) xmalloc(sizeof(packet_t));
 
@@ -135,11 +140,13 @@ int ingest_pkt (rel_t* r, void* payload, size_t len) {
         // Compute checksum.
         pkt->cksum  = cksum(pkt, pkt_size); // don't use pkt->len here, it's in network order
 
-        // Enqueue, guaranteed to succeed because we checked for buf_space above.
-        put_pkt(r->pkt_buf, pkt);
-
         // The packet is placed under LAST_FRAME_SENT, so we need to actually send it.
-        fprintf(stderr, "[SEND] %u\n", get_seqno(pkt));
+        if (len > 0) {
+            // Enqueue, guaranteed to succeed because we checked for buf_space above.
+            put_pkt(r->pkt_buf, pkt);
+            // fprintf(stderr, "[SEND] %u\n", get_seqno(pkt));
+        }
+
         conn_sendpkt(r->c, pkt, pkt_size);
 
         return 0;
@@ -178,6 +185,31 @@ void resend (rel_t* r) {
 }
 
 
+// Acknowledges the recieval of the specified packet.
+void ack_pkt (rel_t* r, packet_t* pkt) {
+    uint32_t ackno = htonl(++r->next_ackno);
+
+    if ((r->pkt_buf->count == 0)) {
+        // No outgoing packets, simply go ahead and send it.
+        struct ack_packet* ack = (struct ack_packet*) xmalloc(sizeof(struct ack_packet));
+
+        ack->cksum  = 0;
+        ack->ackno  = ackno;
+        ack->len    = htons(8);
+        ack->cksum  = cksum(ack, 8);
+
+        conn_sendpkt(r->c, (packet_t*) ack, 8);
+    } else {
+        // Buffer full.
+        // Piggyback off of the next outgoing packet.
+        packet_t* pkt_out = &(r->pkt_buf->buffer[r->pkt_buf->writer - 1]);
+
+        pkt_out->ackno = ackno;
+        pkt_out->cksum = cksum(pkt_out, get_size(pkt_out));
+    }
+}
+
+
 // [LOGIC]
 
 // Creates a new reliable protocol session,
@@ -203,6 +235,12 @@ rel_t* rel_create (conn_t *c, const struct sockaddr_storage *ss, const struct co
     rel_list->prev = &r->next;
     rel_list = r;
 
+    // Config sanity checks.
+    if (cc->window < 1) {
+        fprintf(stderr, "Window must at least be 1.\n");
+        exit(1);
+    }
+
     // Initialize sender / reciever state.
     r->next_seqno = 1;
     r->next_ackno = 1;
@@ -220,6 +258,9 @@ rel_t* rel_create (conn_t *c, const struct sockaddr_storage *ss, const struct co
     r->pkt_buf->size = cc->window;
     r->pkt_buf->buffer = (packet_t*) calloc(cc->window, sizeof(packet_t));
 
+    // Initialize state flags
+    r->read_error = 0;
+
     return r;
 }
 
@@ -232,14 +273,16 @@ void rel_destroy (rel_t *r) {
     *r->prev = r->next;
     conn_destroy (r->c);
 
+    // @TODO: This causes a segfault at the moment.
+
     // Free packet contents, buffer space
     // and finally the buffer struct itself.
-    size_t i;
-    for (i = 0; i < r->pkt_buf->size; i++) {
-        free(r->pkt_buf->buffer[i].data);
-    }
-    free(r->pkt_buf->buffer);
-    free(r->pkt_buf);
+    // size_t i;
+    // for (i = 0; i < r->pkt_buf->size; i++) {
+    //     free(r->pkt_buf->buffer[i].data);
+    // }
+    // free(r->pkt_buf->buffer);
+    // free(r->pkt_buf);
 }
 
 // Called whenever we have recieved a packet.
@@ -253,7 +296,7 @@ void rel_recvpkt (rel_t *r, packet_t *pkt, size_t n) {
         packet_t* next_pkt = read_pkt(r->pkt_buf);
 
         while (next_pkt != NULL && get_seqno(next_pkt) < pkt->ackno) {
-            fprintf(stderr, "[ACK] %u\n", get_seqno(next_pkt));
+            // fprintf(stderr, "[ACK] %u\n", get_seqno(next_pkt));
             pop_pkt(r->pkt_buf);
             next_pkt = read_pkt(r->pkt_buf);
         }
@@ -261,24 +304,19 @@ void rel_recvpkt (rel_t *r, packet_t *pkt, size_t n) {
         // Buffer has space now, read remaining inputs.
         rel_read(r);
 
+    } else if (get_size(pkt) == 12) {
+        // EOF
+        fprintf(stderr, "Recieved EOF\n");
+
+        conn_output(r->c, pkt->data, 0);
+
+        if (r->read_error && (r->pkt_buf->count == 0)) {
+            rel_destroy(r);
+        }
+
     } else {
         // Send ACK.
-        struct ack_packet* ack = (struct ack_packet*) xmalloc(sizeof(struct ack_packet));
-        ack->cksum  = 0;
-        ack->ackno  = htonl(++r->next_ackno);
-        ack->len    = htons(8);
-        ack->cksum  = cksum(ack, 8);
-
-        if (r->pkt_buf->count == 0) {
-            // No outgoing packets, simply go ahead and send it.
-            put_pkt(r->pkt_buf, (packet_t*) ack);
-            conn_sendpkt(r->c, (packet_t*) ack, 8);
-
-            fprintf(stderr, "Sending ACK for %u\n", ntohl(ack->ackno));
-        } else {
-            // @TODO: Piggybacking!
-            conn_sendpkt(r->c, (packet_t*) ack, 8); // Not good, ACKs need to be buffered as well
-        }
+        ack_pkt(r, pkt);
 
         // Output payload.
         int bytes_outputted = conn_output(r->c, pkt->data, (get_size(pkt) - 12));
@@ -297,9 +335,15 @@ void rel_read (rel_t *s) {
         // Read a single packet into the current window.
         int bytes_read = conn_input(s->c, inp_buf, PAYLOAD_SIZE);
 
-        if (bytes_read >= 0) {
-            ingest_pkt(s, inp_buf, bytes_read);
+        s->read_error = 0;
+        if (bytes_read == -1) {
+            s->read_error = 1;
+            fprintf(stderr, "[EOF]\n");
+        } else if (bytes_read == 0) {
+            return;
         }
+
+        ingest_pkt(s, inp_buf, bytes_read);
     }
 }
 
